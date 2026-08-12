@@ -744,6 +744,94 @@ def enhance(image):
 
 
 # ---------------------------------------------------------------------------
+# Temporal consistency
+# ---------------------------------------------------------------------------
+
+TRACK_TOLERANCE = 0.25   # corners closer than this, relative to the mean side
+                         # length, are the same quadrangle seen again
+TRACK_AGREEMENT = 3      # frames a rival must repeat before it takes over
+TRACK_PATIENCE = 10      # frames a held quadrangle survives with no detection
+TRACK_SMOOTHING = 0.5    # weight given to new corners that agree with the held
+
+
+class Tracker:
+    """Holds the quadrangle the scene keeps agreeing on.
+
+    One frame cannot settle which rectangle is the target. A rectangle cut out
+    of the middle of a painting is as well-formed and as well-supported as the
+    painting; so is the one a door frame spans with a cornice; and the ranking
+    between them turns on a few grey levels either way. Every measure tried on
+    a single frame -- support, brightness, interior flatness, boundary
+    contrast -- wins one of those cases by giving up another.
+
+    Across frames they separate on their own, because the object is still
+    there in the next frame and its rivals are not. So a detection agreeing
+    with what is held refines it, and one that disagrees has to repeat itself
+    before taking over: flicker never repeats, and a camera moving to a new
+    object does, within a fraction of a second.
+    """
+
+    def __init__(self):
+        self.held = None
+        self.contradicted = 0
+        self.missing = 0
+
+    def agree(self, a, b):
+        """True when two quadrangles are the same one, allowing for motion.
+
+        Corner distance is measured against the quadrangle's own size, so the
+        same tolerance covers a board filling the frame and a book across the
+        room.
+
+        ponytail: both are assumed to start from the same corner, which
+        order_corners settles. A quadrangle rotating through 45 degrees can
+        flip which corner comes first, and this then reads as a disagreement
+        that costs TRACK_AGREEMENT frames to recover from. Compare over all
+        four rotations if that ever shows up as flapping.
+        """
+        scale = float(np.linalg.norm(np.roll(a, -1, axis=0) - a, axis=1).mean())
+        if scale < 1e-6:
+            return False
+        return float(np.linalg.norm(a - b, axis=1).max()) < TRACK_TOLERANCE * scale
+
+    def update(self, corners):
+        """Feed one frame's detection, or None, and get the quadrangle to use."""
+        if corners is None:
+            self.missing += 1
+            if self.missing > TRACK_PATIENCE:
+                self.held, self.contradicted = None, 0
+            return self.held
+        self.missing = 0
+
+        # Nothing held yet means nothing to protect, so the first detection is
+        # taken at once rather than making the view wait for a quorum.
+        if self.held is None:
+            self.held, self.contradicted = corners, 0
+            return self.held
+
+        if self.agree(self.held, corners):
+            # Averaging in the agreeing fit is what takes the jitter out of a
+            # per-frame estimate; section 3.2 is sensitive enough to corner
+            # noise that this alone steadies the aspect ratio.
+            self.held = ((1.0 - TRACK_SMOOTHING) * self.held
+                         + TRACK_SMOOTHING * corners)
+            self.contradicted = 0
+            return self.held
+
+        # Counting contradictions, rather than waiting for a rival to repeat
+        # itself, is what keeps the tracker alive. Requiring agreement between
+        # successive rivals sounds stricter and is: when the camera moves
+        # enough that no two frames agree on anything, no rival ever reaches a
+        # quorum and the tracker holds its first detection forever. A held
+        # quadrangle that successive frames keep contradicting is wrong, and
+        # whether they contradict it in the same way does not change that.
+        self.contradicted += 1
+        if self.contradicted >= TRACK_AGREEMENT:
+            self.held, self.contradicted = corners, 0
+        return self.held
+
+
+# ---------------------------------------------------------------------------
 # Live loop
 # ---------------------------------------------------------------------------
 
@@ -902,8 +990,10 @@ def main():
 
     enhancement = not args.no_enhance
     debug = args.debug
-    # The board is static relative to the camera over short intervals, so the
-    # last good detection carries the rectified view through dropped frames.
+    # A single frame cannot settle which rectangle is the target, so the
+    # tracker holds the one successive frames keep agreeing on, and carries it
+    # through frames where detection finds nothing.
+    tracker = Tracker()
     last_corners, last_aspect, last_focal = None, None, None
     solved_focals = deque(maxlen=30)
 
@@ -923,15 +1013,20 @@ def main():
 
         if corners is not None:
             corners = order_corners(corners / args.scale)
+        held = tracker.update(corners)
+
+        if held is not None:
             # The lens does not change, so the median of what past views
             # solved for is a better focal length than this view's own.
             steady = float(np.median(solved_focals)) if solved_focals else None
             aspect, focal, solved = estimate_aspect_ratio(
-                corners, frame.shape[1], frame.shape[0], steady)
+                held, frame.shape[1], frame.shape[0], steady)
             if solved is not None:
                 solved_focals.append(solved)
             if aspect is not None:
-                last_corners, last_aspect, last_focal = corners, aspect, focal
+                last_corners, last_aspect, last_focal = held, aspect, focal
+        else:
+            last_corners, last_aspect, last_focal = None, None, None
 
         status = f"{1.0 / max(elapsed, 1e-6):.1f} fps detection | " \
                  f"enhance {'on' if enhancement else 'off'} (e) | " \

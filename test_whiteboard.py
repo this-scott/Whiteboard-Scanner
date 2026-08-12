@@ -76,7 +76,49 @@ def demo():
     fixed, used, again = wb.estimate_aspect_ratio(corners, 320, 240, 500.0)
     assert used == 500.0 and again == solved
 
+    check_tracker()
     print("ok")
+
+
+def check_tracker():
+    """The tracker keeps what frames agree on and ignores what they don't."""
+    here = np.array([[100., 100.], [300., 100.], [300., 260.], [100., 260.]])
+    rival = here + 90.0                       # a different quadrangle entirely
+    jitter = lambda q, n: q + np.array([[n, -n], [-n, n], [n, n], [-n, -n]])
+
+    # The first detection is taken at once: nothing is held yet to protect.
+    t = wb.Tracker()
+    assert np.allclose(t.update(here), here)
+
+    # One frame of a rival cannot take the view away, and the target returning
+    # finds the tracker still on it.
+    for _ in range(4):
+        t.update(jitter(here, 2.0))
+    assert t.agree(t.update(rival), here), "a single rival frame stole the view"
+    assert t.agree(t.update(here), here)
+
+    # A rival that keeps showing up is the camera moving, and does take over.
+    for _ in range(wb.TRACK_AGREEMENT):
+        held = t.update(rival)
+    assert t.agree(held, rival), "a persistent rival never took over"
+
+    # Jitter is averaged down rather than followed frame for frame.
+    t = wb.Tracker()
+    t.update(here)
+    noisy = [jitter(here, 6.0 if i % 2 else -6.0) for i in range(8)]
+    held = [t.update(q) for q in noisy]
+    moved = max(float(np.abs(held[i] - held[i - 1]).max()) for i in range(1, len(held)))
+    fed = max(float(np.abs(noisy[i] - noisy[i - 1]).max()) for i in range(1, len(noisy)))
+    assert moved < fed, "smoothing did not reduce jitter (%.1f vs %.1f)" % (moved, fed)
+
+    # A held quadrangle survives a gap in detection, then is dropped.
+    t = wb.Tracker()
+    t.update(here)
+    for _ in range(wb.TRACK_PATIENCE):
+        assert t.update(None) is not None, "dropped the target too eagerly"
+    assert t.update(None) is None, "held a target through a long blackout"
+    print("tracker   flicker rejected, move adopted, jitter %.1f -> %.1f px"
+          % (fed, moved))
 
 
 if __name__ == "__main__":
