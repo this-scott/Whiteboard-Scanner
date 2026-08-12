@@ -28,11 +28,15 @@ import cv2
 import numpy as np
 
 # --- Section 3.1 parameters (values from the paper) -------------------------
-GRADIENT_THRESHOLD = 15      # T_G, on G = |Gx| + |Gy|. The paper's 40 suits a
-                             # dark-framed board on a plain wall; a page on a
-                             # white desk or a book against dark carpet has
-                             # boundaries far weaker than that, and at 40 most
-                             # of the target's own perimeter is simply unseen.
+GRADIENT_THRESHOLD = 40      # T_G, on G = |Gx| + |Gy|. Lowering this to 15
+                             # does let a low-contrast target -- a page on a
+                             # white desk -- register far more of its own
+                             # perimeter, but the weak edges that come with it
+                             # drag the line fits off the true boundary, and
+                             # the corners lose the precision that section 3.2
+                             # needs: the quadrangle keeps roughly the right
+                             # area while its aspect ratio goes to 4 or 7. It
+                             # also costs a quarter of the frame rate.
 RHO_BIN = 5.0                # rho cell size, pixels
 THETA_BIN = np.deg2rad(2.0)  # theta cell size, 2 degrees
 PEAK_FRACTION = 0.05         # keep local maxima above 5% of the max vote
