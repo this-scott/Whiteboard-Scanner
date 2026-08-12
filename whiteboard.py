@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+from collections import deque
 from datetime import datetime
 
 import cv2
@@ -38,7 +39,8 @@ PERPENDICULAR_TOLERANCE = np.deg2rad(30.0)  # neighbours within 30 deg of 90
 SUPPORT_DISTANCE = 3.0       # an edge within 3 px of a side supports it
 REFINE_NEIGHBOURHOOD = 10.0  # line refitting neighbourhood, pixels
 QUALITY_THRESHOLD = 0.5      # a side must be mostly covered by real edges
-QUALITY_TIE = 0.01           # quadrangles within this of the best tie on size
+QUALITY_TIE = 0.01           # quadrangles within this of the best are ranked on
+BRIGHTNESS_TIE = 0.9         # interior brightness, and those within this on size
 MAX_EDGE_DENSITY = 0.8       # above this the frame is texture, not a scene
 
 # --- Section 3.4 parameters -------------------------------------------------
@@ -49,7 +51,6 @@ S_CURVE_P = 0.75             # steepness of the S-shaped curve
 MAX_LINES = 60               # cap on Hough peaks, keeps quadrangle search sane
 MAX_PAIRS = 60               # opposing line pairs kept, widest separation first
 MAX_QUADRANGLES = 4000       # cap on quadrangles built per frame
-MAX_CANDIDATES = 250         # quadrangles scored per frame, largest first
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +221,11 @@ def form_quadrangles(lines, width, height):
                 continue
 
             for second in ((b, d), (d, b)):
-                sides = [lines[a], lines[second[0]], lines[c], lines[second[1]]]
+                sides = [a, second[0], c, second[1]]
                 corners = []
                 for k in range(4):
-                    point = line_intersection(sides[k], sides[(k + 1) % 4])
+                    point = line_intersection(lines[sides[k]],
+                                              lines[sides[(k + 1) % 4]])
                     if point is None:
                         break
                     corners.append(point)
@@ -249,130 +251,112 @@ def form_quadrangles(lines, width, height):
                 # sides[k] owns the segment corners[k] -> corners[k+1], which
                 # is the pairing the verification and refining steps assume.
                 quadrangles.append((corners, sides[1:] + sides[:1], circumference))
-    return quadrangles
+
+    if not quadrangles:
+        return None, None, None
+    # Stacked, because verification scores the whole batch in one pass.
+    return (np.stack([q[0] for q in quadrangles]),
+            np.array([q[1] for q in quadrangles]),
+            np.array([q[2] for q in quadrangles]))
 
 
 # ---------------------------------------------------------------------------
 # 3.1  Quadrangle verification
 # ---------------------------------------------------------------------------
 
-class OrientationIndex:
-    """Edges bucketed by gradient orientation, built once per frame.
+class LineSupport:
+    """Where along each Hough line the real edges are, as prefix sums.
 
-    Verification asks the same question thousands of times -- which edges lie
-    along a given direction -- so the answer is precomputed. Orientations are
-    taken modulo pi, matching `similar_orientation`, and each bucket keeps the
-    edges within the tolerance of its centre, so a lookup is one array index
-    instead of a full scan.
+    Verification asks the same question for every candidate: how much of this
+    segment is backed by edges. Every segment lies on one of the few dozen
+    Hough lines, so the answer is precomputed per line instead of per
+    candidate -- bin the edges that support the line into one-pixel cells
+    along it, then cumulatively sum, and a segment's covered length becomes
+    the difference of two lookups.
+
+    That difference is what lets `quality` score *every* candidate. Scoring
+    used to cost a scan per side, so only the largest few hundred quadrangles
+    could be afforded, and since the board is never the largest thing a
+    cluttered room produces -- a door frame and a picture frame make a much
+    bigger quadrangle -- the true board was routinely dropped before it was
+    ever scored.
     """
 
-    def __init__(self, xs, ys, theta, buckets=36):
-        self.buckets = buckets
-        self.width = np.pi / buckets
-        # A bucket admits edges within the orientation tolerance of its
-        # centre, so that tolerance -- not the bucket width -- bounds how far
-        # a member line can lean away from the bucket's normal, and hence how
-        # far its edges spread along the projection axis.
-        extent = float(np.hypot(xs.max(), ys.max())) if len(xs) else 0.0
-        self.drift = extent * np.sin(OPPOSITE_TOLERANCE)
-        folded = theta % np.pi
-        self.entries = []
-        for b in range(buckets):
-            centre = (b + 0.5) * self.width
-            difference = np.abs(folded - centre)
-            difference = np.minimum(difference, np.pi - difference)
-            selected = np.nonzero(difference < OPPOSITE_TOLERANCE)[0]
+    def __init__(self, lines, xs, ys, theta, width, height):
+        # One bin per pixel of projected distance along the line. Corners can
+        # sit outside the image, so the axis spans the diagonal either way.
+        self.offset = float(np.hypot(width, height))
+        self.bins = int(2 * self.offset) + 2
+        self.angles = np.array([line[1] for line in lines])
+        self.prefix = np.zeros((len(lines), self.bins), np.int32)
+        for i, (rho, angle, _) in enumerate(lines):
+            # An edge supports a line when it lies within 3 px of it and its
+            # gradient points along the line's normal, modulo pi.
+            distance = np.abs(xs * np.cos(angle) + ys * np.sin(angle) - rho)
+            near = np.nonzero((distance < SUPPORT_DISTANCE)
+                              & similar_orientation(theta, angle))[0]
+            if len(near) == 0:
+                continue
+            along = -xs[near] * np.sin(angle) + ys[near] * np.cos(angle)
+            cells = np.clip((along + self.offset).astype(np.int32), 0, self.bins - 1)
+            # Set rather than add: edges are two or three pixels thick and
+            # bunch up around writing, so a count of pixels lets a short side
+            # crossing a scribble out-score a long genuine border. Coverage of
+            # the side's length is what the ratio is meant to express.
+            self.prefix[i, cells] = 1
+        np.cumsum(self.prefix, axis=1, out=self.prefix)
 
-            # Within a bucket, sort by distance along the bucket's own normal.
-            # Every edge supporting a given side shares that side's rho to
-            # within the support distance, so a sorted axis turns the test
-            # into a slice of a few hundred candidates rather than a scan of
-            # the bucket, which the wide orientation tolerance leaves large.
-            bx, by = xs[selected], ys[selected]
-            projection = bx * np.cos(centre) + by * np.sin(centre)
-            order = np.argsort(projection)
-            self.entries.append((bx[order], by[order], projection[order], centre))
-
-    def near_line(self, angle, rho, margin):
-        """Edges oriented like `angle` whose distance to that line is within margin.
-
-        The caller's rho is signed against its own normal, which may point
-        opposite to the bucket's, so rather than trying to flip the sign the
-        line is re-projected onto the bucket's normal -- one point on the
-        line, measured the bucket's way -- which is unambiguous.
-        """
-        bucket = int((angle % np.pi) / self.width) % self.buckets
-        bx, by, projection, centre = self.entries[bucket]
-        if len(bx) == 0:
-            return bx, by
-
-        # A point on the caller's line, projected onto the bucket's normal.
-        point = np.array([rho * np.cos(angle), rho * np.sin(angle)])
-        centred = point[0] * np.cos(centre) + point[1] * np.sin(centre)
-
-        # A line assigned to this bucket can lean up to half a bucket width
-        # away from the bucket's normal, so its edges spread across the image
-        # rather than sitting at one projection; widen the slice to cover it.
-        low = np.searchsorted(projection, centred - margin - self.drift)
-        high = np.searchsorted(projection, centred + margin + self.drift)
-        return bx[low:high], by[low:high]
+    def covered(self, corners, sides):
+        """Covered length of each side of each candidate. Shapes (M,4,2), (M,4)."""
+        angles = self.angles[sides]
+        following = np.roll(corners, -1, axis=1)
+        starts = -corners[..., 0] * np.sin(angles) + corners[..., 1] * np.cos(angles)
+        ends = -following[..., 0] * np.sin(angles) + following[..., 1] * np.cos(angles)
+        low = np.clip(np.minimum(starts, ends) + self.offset, 0, self.bins - 1)
+        high = np.clip(np.maximum(starts, ends) + self.offset, 0, self.bins - 1)
+        return (self.prefix[sides, high.astype(np.int32)]
+                - self.prefix[sides, low.astype(np.int32)])
 
 
-def quality(corners, sides, circumference, index):
-    """Fraction of the circumference actually backed by oriented edges.
+def interior_brightness(gray, corners):
+    """Mean luminance inside each quadrangle, sampled on a coarse grid.
+
+    Edge support alone cannot tell a whiteboard from any other well-formed
+    rectangle in the room: a door frame, a picture frame, the cornice and the
+    skirting board are all real, straight and fully supported, and the
+    rectangle they span is *larger* than the board, so the paper's "prefer the
+    biggest" rule hands it the win. What separates them is the thing the whole
+    method is named after -- the board is white, and the wall is not.
+
+    The grid is inset from the border so that the board's own dark frame is
+    not sampled, and nearest-neighbour is enough at this resolution.
+    """
+    u, v = np.meshgrid(np.linspace(0.15, 0.85, 6), np.linspace(0.15, 0.85, 6))
+    u, v = u.ravel(), v.ravel()
+    weights = np.stack([(1 - u) * (1 - v), u * (1 - v), u * v, (1 - u) * v], 1)
+    points = np.einsum("pk,mkc->mpc", weights, corners)
+    x = np.clip(points[..., 0], 0, gray.shape[1] - 1).astype(np.int32)
+    y = np.clip(points[..., 1], 0, gray.shape[0] - 1).astype(np.int32)
+    return gray[y, x].mean(axis=1)
+
+
+def quality(corners, sides, circumference, support):
+    """Fraction of each circumference actually backed by oriented edges.
 
     Hough lines are infinite and say nothing about where their support lies,
     so a quadrangle of four well-placed lines can still be spurious (Fig. 2).
-    An edge counts as supporting a side when it lies within 3 px of it *and*
-    has a similar orientation; the quality measure is the ratio of supporting
-    edges to the circumference.
-
-    Support is measured as *covered length* rather than a raw pixel count:
-    edges are two or three pixels thick and bunch up around writing on the
-    board, so counting pixels lets a short side crossing a dense scribble
-    out-score a long genuine border, and the winner becomes a sub-rectangle
-    of the true boundary. Bucketing each side into one-pixel bins along its
-    length makes the measure a true fraction of the perimeter that is backed
-    by edges, which is what the ratio is meant to express.
+    The quality measure is the ratio of supported perimeter to the whole
+    perimeter, scored for every candidate at once.
     """
-    supporting = 0.0
-    for k in range(4):
-        p0, p1 = corners[k], corners[(k + 1) % 4]
-        direction = p1 - p0
-        length = np.linalg.norm(direction)
-        if length < 1e-6:
-            continue
-        normal = np.array([-direction[1], direction[0]]) / length
-
-        # Only edges whose orientation already matches this side can support
-        # it, and that subset is precomputed once per frame. Testing every
-        # edge in the image against every side of every candidate is what
-        # makes a cluttered frame take a second: the orientation index turns
-        # tens of thousands of points into the few hundred that lie along
-        # this direction.
-        xs_k, ys_k = index.near_line(sides[k][1], sides[k][0], SUPPORT_DISTANCE + 1.0)
-        if len(xs_k) == 0:
-            continue
-
-        # Perpendicular distance to the side, plus the projection onto it so
-        # that only edges within the segment (not the infinite line) count.
-        dx, dy = xs_k - p0[0], ys_k - p0[1]
-        distance = np.abs(dx * normal[0] + dy * normal[1])
-        along = (dx * direction[0] + dy * direction[1]) / length
-
-        selected = (distance < SUPPORT_DISTANCE) & (along >= 0) & (along <= length)
-        if not np.any(selected):
-            continue
-        # Cap coverage at the side's own length: a bin only exists because
-        # that stretch of the side is covered, so more bins than the side is
-        # long means rounding, not extra evidence. Left uncapped the measure
-        # exceeds 1 and stops being a fraction, which lets a small crisp
-        # rectangle beat a large one and forces the size comparison below to
-        # arbitrate cases quality should have settled.
-        bins = np.unique(along[selected].astype(np.int32))
-        supporting += min(float(len(bins)), length)
-
-    return supporting / circumference
+    lengths = np.linalg.norm(np.roll(corners, -1, axis=1) - corners, axis=2)
+    # Cap coverage at each side's own length: a bin only exists because that
+    # stretch of the side is covered, so more bins than the side is long means
+    # rounding, not extra evidence. Left uncapped the measure exceeds 1 and
+    # stops being a fraction, which lets a small crisp rectangle beat a large
+    # one and forces the size comparison to arbitrate what quality should have
+    # settled.
+    covered = np.minimum(support.covered(corners, sides), lengths)
+    return covered.sum(axis=1) / circumference
 
 
 # ---------------------------------------------------------------------------
@@ -505,40 +489,34 @@ def detect_whiteboard(frame):
     if len(lines) < 4:
         return None, mask, accumulator
 
-    candidates = form_quadrangles(lines, width, height)
-    if not candidates:
+    corners, sides, circumference = form_quadrangles(lines, width, height)
+    if corners is None:
         return None, mask, accumulator
 
-    # A cluttered room yields tens of thousands of candidates, and scoring one
-    # means measuring edge support along its whole perimeter, so scoring them
-    # all costs far more than a live frame can afford. Only the largest are
-    # scored, the board being expected to be the biggest thing that survives
-    # the criteria. Every survivor within the budget is then scored in full:
-    # stopping at the first sufficiently good one instead lets a large but
-    # mediocre quadrangle be accepted before the real board is ever examined.
-    candidates.sort(key=lambda candidate: -candidate[2])
-    index = OrientationIndex(xs, ys, theta)
-    scored = []
-    for corners, sides, circumference in candidates[:MAX_CANDIDATES]:
-        score = quality(corners, sides, circumference, index)
-        if score >= QUALITY_THRESHOLD:
-            scored.append((score, circumference, corners, sides))
-    if not scored:
+    support = LineSupport(lines, xs, ys, theta, width, height)
+    scores = quality(corners, sides, circumference, support)
+
+    # Quality leads, and only decides among quadrangles whose support is
+    # genuinely comparable to the best one; weighting quality against the
+    # other measures lets a marginally bigger quadrangle with visibly worse
+    # edge support win by a hair, which under noise is the wrong call.
+    contenders = np.nonzero(scores >= max(scores.max() - QUALITY_TIE,
+                                          QUALITY_THRESHOLD))[0]
+    if len(contenders) == 0:
         return None, mask, accumulator
 
-    # Quality leads and size only breaks ties. Weighting the two against each
-    # other lets a marginally bigger quadrangle with visibly worse edge
-    # support win by a hair, which under noise is exactly the wrong call, so
-    # size decides only among quadrangles whose support is genuinely
-    # comparable to the best one.
-    best_quality = max(score for score, _, _, _ in scored)
-    contenders = [entry for entry in scored
-                  if entry[0] >= best_quality - QUALITY_TIE]
-    _, _, corners, sides = max(contenders, key=lambda entry: entry[1])
-    best = (corners, sides)
+    # Then the whitest, and only then the biggest. Size alone hands the win to
+    # the wall rectangle that a door frame and a cornice span; brightness
+    # alone would take a crisp bright patch of the board over the board, since
+    # both are equally white. Ranking on brightness first and letting size
+    # settle what brightness cannot keeps both failures out.
+    brightness = interior_brightness(gray, corners[contenders])
+    contenders = contenders[brightness >= BRIGHTNESS_TIE * brightness.max()]
+    best = contenders[np.argmax(circumference[contenders])]
+    corners, sides = corners[best], sides[best]
 
-    corners, sides = best
-    refined = [refine_side(sides[k], corners[k], corners[(k + 1) % 4], xs, ys, theta)
+    refined = [refine_side(lines[sides[k]], corners[k], corners[(k + 1) % 4],
+                           xs, ys, theta)
                for k in range(4)]
     points = []
     for k in range(4):
@@ -553,8 +531,8 @@ def detect_whiteboard(frame):
 # 3.2  Aspect ratio and focal length from a single view
 # ---------------------------------------------------------------------------
 
-def estimate_aspect_ratio(corners, width, height):
-    """Estimate (aspect ratio, focal length) from the quadrangle.
+def estimate_aspect_ratio(corners, width, height, focal=None):
+    """Estimate (aspect ratio, focal length used, focal length solved).
 
     Implements equations (11), (12), (14), (16), (17), (20) and (21). The
     corners must arrive in the paper's ordering: m1 = (0,0), m2 = (w,0),
@@ -563,6 +541,12 @@ def estimate_aspect_ratio(corners, width, height):
     Assumes square pixels (s = 1) and the principal point at the image
     centre, which are the assumptions the paper makes to reduce the two
     constraints to a solvable system.
+
+    A caller with a better focal length than one frame can offer -- the camera
+    keeps the same lens from frame to frame, while equation (21) is sensitive
+    enough to corner noise to swing by a factor of four between consecutive
+    frames of a stationary board -- passes it in, and gets back the value this
+    view alone would have solved for, or None where it solves for nothing.
     """
     m1 = np.array([corners[0][0], corners[0][1], 1.0])
     m2 = np.array([corners[1][0], corners[1][1], 1.0])
@@ -575,7 +559,7 @@ def estimate_aspect_ratio(corners, width, height):
     denominator_2 = np.dot(np.cross(m2, m4), m3)
     denominator_3 = np.dot(np.cross(m3, m4), m2)
     if abs(denominator_2) < 1e-9 or abs(denominator_3) < 1e-9:
-        return None, None
+        return None, focal, None
     k2 = np.dot(np.cross(m1, m4), m3) / denominator_2
     k3 = np.dot(np.cross(m1, m4), m2) / denominator_3
 
@@ -598,16 +582,16 @@ def estimate_aspect_ratio(corners, width, height):
             (n21 * n31 - (n21 * n33 + n23 * n31) * u0 + n23 * n33 * u0 * u0) * s * s
             + (n22 * n32 - (n22 * n33 + n23 * n32) * v0 + n23 * n33 * v0 * v0))
 
-    if f_squared is None or f_squared <= 0:
-        # A negative f^2 means the quadrangle is not a plausible projection of
-        # a rectangle under these assumptions; fall back to a nominal focal
-        # length so that rectification still produces something usable.
-        focal = float(max(width, height))
-    else:
-        focal = float(np.sqrt(f_squared))
+    # A negative f^2 means the quadrangle is not a plausible projection of a
+    # rectangle under these assumptions, and this view solves for nothing.
+    solved = None if f_squared is None or f_squared <= 0 else float(np.sqrt(f_squared))
 
-    A = np.array([[focal, 0.0, u0],
-                  [0.0, s * focal, v0],
+    # Whatever the caller knows beats this view, then this view, then a
+    # nominal focal length so that rectification still produces something.
+    used = focal or solved or float(max(width, height))
+
+    A = np.array([[used, 0.0, u0],
+                  [0.0, s * used, v0],
                   [0.0, 0.0, 1.0]])
     A_inv = np.linalg.inv(A)
     B = A_inv.T @ A_inv  # A^-T A^-1
@@ -616,8 +600,8 @@ def estimate_aspect_ratio(corners, width, height):
     numerator = n2 @ B @ n2
     denominator = n3 @ B @ n3
     if denominator <= 1e-12 or numerator <= 0:
-        return None, focal
-    return float(np.sqrt(numerator / denominator)), focal
+        return None, used, solved
+    return float(np.sqrt(numerator / denominator)), used, solved
 
 
 # ---------------------------------------------------------------------------
@@ -780,14 +764,20 @@ def save_screens(root, overlay, rectified, hough, edges, frame, small,
                  enhancement, scale):
     """Write every view plus a JSON record of the detection under `root`.
 
-    One timestamp names all five files of a capture, so a record and the
-    images it describes line up by filename across the folders. A view that
-    does not exist for this frame -- no board found, so no rectified image --
-    is simply not written, and the JSON says so rather than a missing file
-    being the only clue.
+    One timestamp names all the files of a capture, so a record and the images
+    it describes line up by filename across the folders. A view that does not
+    exist for this frame -- no board found, so no rectified image -- is simply
+    not written, and the JSON says so rather than a missing file being the
+    only clue.
+
+    The untouched frame is saved alongside the annotated one. Everything else
+    here is a view of a decision already taken, so a saved run can be looked
+    at but not re-run; the raw frame is what lets a parameter change be
+    replayed against the exact images that misbehaved.
     """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     views = {
+        "frame": frame,
         "camera_detection": overlay,
         "rectified_whiteboard": rectified,
         "hough": hough,
@@ -833,6 +823,8 @@ def save_screens(root, overlay, rectified, hough, edges, frame, small,
             "support_distance": SUPPORT_DISTANCE,
             "refine_neighbourhood": REFINE_NEIGHBOURHOOD,
             "quality_threshold": QUALITY_THRESHOLD,
+            "quality_tie": QUALITY_TIE,
+            "brightness_tie": BRIGHTNESS_TIE,
             "cell_size": CELL_SIZE,
             "top_percentile": TOP_PERCENTILE,
             "s_curve_p": S_CURVE_P,
@@ -899,6 +891,7 @@ def main():
     # The board is static relative to the camera over short intervals, so the
     # last good detection carries the rectified view through dropped frames.
     last_corners, last_aspect, last_focal = None, None, None
+    solved_focals = deque(maxlen=30)
 
     while True:
         ok, frame = capture.read()
@@ -916,7 +909,13 @@ def main():
 
         if corners is not None:
             corners = order_corners(corners / args.scale)
-            aspect, focal = estimate_aspect_ratio(corners, frame.shape[1], frame.shape[0])
+            # The lens does not change, so the median of what past views
+            # solved for is a better focal length than this view's own.
+            steady = float(np.median(solved_focals)) if solved_focals else None
+            aspect, focal, solved = estimate_aspect_ratio(
+                corners, frame.shape[1], frame.shape[0], steady)
+            if solved is not None:
+                solved_focals.append(solved)
             if aspect is not None:
                 last_corners, last_aspect, last_focal = corners, aspect, focal
 
