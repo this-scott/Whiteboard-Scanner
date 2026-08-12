@@ -16,15 +16,15 @@ import whiteboard as wb
 BOARD = np.array([[45, 40], [250, 28], [255, 190], [50, 200]], np.float32)
 
 
-def scene(clutter):
-    """Beige wall, a whiteboard, and rectangles that compete with it."""
+def scene(clutter, fill=(232, 232, 230)):
+    """Beige wall, a rectangular target, and rectangles that compete with it."""
     image = np.full((240, 320, 3), 185, np.uint8)
     image[:, 298:303] = 90                                  # door frame
     image[:, 6:9] = 100                                     # picture frame
-    cv2.fillConvexPoly(image, BOARD.astype(np.int32), (232, 232, 230))
+    cv2.fillConvexPoly(image, BOARD.astype(np.int32), fill)
     cv2.polylines(image, [BOARD.astype(np.int32)], True, (70, 70, 70), 2)
-    cv2.putText(image, "abc", (90, 90), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (120, 90, 60), 1)                      # writing
+    ink = (120, 90, 60) if sum(fill) / 3 > 128 else (230, 230, 230)
+    cv2.putText(image, "abc", (90, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ink, 1)
     if clutter:
         cv2.rectangle(image, (10, 150), (40, 235), (150, 150, 150), 1)
         cv2.rectangle(image, (14, 160), (36, 225), (140, 140, 140), 1)
@@ -50,6 +50,16 @@ def demo():
         # of its centre line; the wall rectangle it must not pick is 50 px out.
         assert error < 8.0, "clutter=%s corner error %.1f px" % (clutter, error)
         print("clutter=%-5s corner error %.1f px" % (clutter, error))
+
+    # The target is picked out by being one surface, not by being a bright
+    # one, so a dark book on a pale desk has to work as well as a whiteboard.
+    for name, fill in (("black", (30, 30, 28)), ("book brown", (60, 110, 150)),
+                       ("mid grey", (140, 140, 138))):
+        corners, _, _ = wb.detect_whiteboard(scene(True, fill))
+        assert corners is not None, "no target found (%s)" % name
+        error = corner_error(corners)
+        assert error < 8.0, "%s target: corner error %.1f px" % (name, error)
+        print("%-10s among competing rectangles, corner error %.1f px" % (name, error))
 
     # Rectifying a known rectangle must return its aspect ratio.
     corners, _, _ = wb.detect_whiteboard(scene(True))

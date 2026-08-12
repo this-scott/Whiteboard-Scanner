@@ -28,7 +28,11 @@ import cv2
 import numpy as np
 
 # --- Section 3.1 parameters (values from the paper) -------------------------
-GRADIENT_THRESHOLD = 40      # T_G, on G = |Gx| + |Gy|
+GRADIENT_THRESHOLD = 15      # T_G, on G = |Gx| + |Gy|. The paper's 40 suits a
+                             # dark-framed board on a plain wall; a page on a
+                             # white desk or a book against dark carpet has
+                             # boundaries far weaker than that, and at 40 most
+                             # of the target's own perimeter is simply unseen.
 RHO_BIN = 5.0                # rho cell size, pixels
 THETA_BIN = np.deg2rad(2.0)  # theta cell size, 2 degrees
 PEAK_FRACTION = 0.05         # keep local maxima above 5% of the max vote
@@ -39,8 +43,10 @@ PERPENDICULAR_TOLERANCE = np.deg2rad(30.0)  # neighbours within 30 deg of 90
 SUPPORT_DISTANCE = 3.0       # an edge within 3 px of a side supports it
 REFINE_NEIGHBOURHOOD = 10.0  # line refitting neighbourhood, pixels
 QUALITY_THRESHOLD = 0.5      # a side must be mostly covered by real edges
-QUALITY_TIE = 0.01           # quadrangles within this of the best are ranked on
-BRIGHTNESS_TIE = 0.9         # interior brightness, and those within this on size
+QUALITY_TIE = 0.05           # quadrangles within this of the best are ranked
+                             # on interior spread. A low-contrast target never
+                             # tops the support ranking outright, so the band
+                             # has to be wide enough to keep it in contention.
 MAX_EDGE_DENSITY = 0.8       # above this the frame is texture, not a scene
 
 # --- Section 3.4 parameters -------------------------------------------------
@@ -318,18 +324,24 @@ class LineSupport:
                 - self.prefix[sides, low.astype(np.int32)])
 
 
-def interior_brightness(gray, corners):
-    """Mean luminance inside each quadrangle, sampled on a coarse grid.
+def interior_spread(gray, corners):
+    """Luminance spread inside each quadrangle, sampled on a coarse grid.
 
-    Edge support alone cannot tell a whiteboard from any other well-formed
-    rectangle in the room: a door frame, a picture frame, the cornice and the
-    skirting board are all real, straight and fully supported, and the
-    rectangle they span is *larger* than the board, so the paper's "prefer the
-    biggest" rule hands it the win. What separates them is the thing the whole
-    method is named after -- the board is white, and the wall is not.
+    Edge support alone cannot tell the target from any other well-formed
+    rectangle in the scene: a door frame with a cornice, or two desk edges
+    with the edge of a magazine, span quadrangles that are real, straight and
+    fully supported, and are often *larger* than the target, so the paper's
+    "prefer the biggest" rule hands them the win. What separates them is that
+    the target is one object and they are not -- a board, a page or a book
+    cover is one surface under one light, while a spurious quadrangle
+    straddles desk, carpet and clutter, and its interior says so.
 
-    The grid is inset from the border so that the board's own dark frame is
-    not sampled, and nearest-neighbour is enough at this resolution.
+    This measure has to stay indifferent to what the object *is*: brightness
+    would work for a whiteboard and then reject a dark book on a pale desk.
+    Spread is a property of a surface, not of its colour.
+
+    The grid is inset from the border so that the object's own frame or
+    shadow is not sampled, and nearest-neighbour is enough at this resolution.
     """
     u, v = np.meshgrid(np.linspace(0.15, 0.85, 6), np.linspace(0.15, 0.85, 6))
     u, v = u.ravel(), v.ravel()
@@ -337,7 +349,7 @@ def interior_brightness(gray, corners):
     points = np.einsum("pk,mkc->mpc", weights, corners)
     x = np.clip(points[..., 0], 0, gray.shape[1] - 1).astype(np.int32)
     y = np.clip(points[..., 1], 0, gray.shape[0] - 1).astype(np.int32)
-    return gray[y, x].mean(axis=1)
+    return gray[y, x].std(axis=1)
 
 
 def quality(corners, sides, circumference, support):
@@ -505,14 +517,13 @@ def detect_whiteboard(frame):
     if len(contenders) == 0:
         return None, mask, accumulator
 
-    # Then the whitest, and only then the biggest. Size alone hands the win to
-    # the wall rectangle that a door frame and a cornice span; brightness
-    # alone would take a crisp bright patch of the board over the board, since
-    # both are equally white. Ranking on brightness first and letting size
-    # settle what brightness cannot keeps both failures out.
-    brightness = interior_brightness(gray, corners[contenders])
-    contenders = contenders[brightness >= BRIGHTNESS_TIE * brightness.max()]
-    best = contenders[np.argmax(circumference[contenders])]
+    # Then the flattest interior wins. Size is not the tie-break the paper
+    # assumes: in a cluttered scene the biggest supported quadrangle is
+    # generally the one spanning the most junk, and quality on its own prefers
+    # small crisp rectangles, since a short perimeter is easier to cover
+    # completely than a long one. Both failures share a cause -- the winner is
+    # not one surface -- which is what the spread measures.
+    best = contenders[np.argmin(interior_spread(gray, corners[contenders]))]
     corners, sides = corners[best], sides[best]
 
     refined = [refine_side(lines[sides[k]], corners[k], corners[(k + 1) % 4],
@@ -824,7 +835,6 @@ def save_screens(root, overlay, rectified, hough, edges, frame, small,
             "refine_neighbourhood": REFINE_NEIGHBOURHOOD,
             "quality_threshold": QUALITY_THRESHOLD,
             "quality_tie": QUALITY_TIE,
-            "brightness_tie": BRIGHTNESS_TIE,
             "cell_size": CELL_SIZE,
             "top_percentile": TOP_PERCENTILE,
             "s_curve_p": S_CURVE_P,
