@@ -15,12 +15,14 @@ the rectified fronto-parallel view of the detected board.
 
 Keys:  q/ESC quit   e toggle enhancement   d toggle debug (edge+Hough) views
        s save every view plus a JSON record under logs/
+       r record a continuous segment of raw frames under logs/segments/
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 from collections import deque
 from datetime import datetime
 
@@ -862,6 +864,55 @@ def hough_image(accumulator):
     return cv2.resize(normalised.astype(np.uint8), (480, 240))
 
 
+class Segment:
+    """A continuous recording: every frame, unannotated, one record per line.
+
+    The 's' key answers "what did it do here", and saves a still of every view
+    to do it. This answers "what did it do over the next ten seconds", which
+    is a different question and wants different things written: frames close
+    enough together to be compared with each other, and nothing that can be
+    recomputed from them. So only the raw frame is stored, and the views --
+    overlay, edges, Hough -- are left to be regenerated offline from it.
+
+    Both the per-frame detection and the tracker's held quadrangle go into the
+    record, so the tracker's constants can be re-tuned against a captured run
+    without re-running detection over it.
+
+    ponytail: frames are written as they arrive, at the lowest PNG compression,
+    which costs a few milliseconds each. Every record carries the elapsed time
+    it was actually written at, so any distortion this causes is visible in
+    the data rather than hidden. Buffer to memory and flush on close if that
+    few milliseconds ever matters.
+    """
+
+    def __init__(self, root, seconds):
+        self.directory = os.path.join(root, "segments",
+                                      datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(self.directory, exist_ok=True)
+        self.records = open(os.path.join(self.directory, "records.jsonl"), "w")
+        self.started = time.monotonic()
+        self.seconds = seconds
+        self.count = 0
+
+    def write(self, frame, record):
+        """Append one frame. False once the segment has run its length."""
+        elapsed = time.monotonic() - self.started
+        name = f"{self.count:05d}.png"
+        cv2.imwrite(os.path.join(self.directory, name), frame,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        self.records.write(json.dumps(dict(record, index=self.count, frame=name,
+                                           elapsed=round(elapsed, 4))) + "\n")
+        self.records.flush()
+        self.count += 1
+        return elapsed < self.seconds
+
+    def close(self):
+        self.records.close()
+        elapsed = time.monotonic() - self.started
+        rate = self.count / elapsed if elapsed > 0 else 0.0
+        return f"{self.count} frames in {elapsed:.1f}s ({rate:.1f} fps) -> {self.directory}"
+
+
 def save_screens(root, overlay, rectified, hough, edges, frame, small,
                  corners, aspect, focal, detected_this_frame, elapsed,
                  enhancement, scale):
@@ -980,6 +1031,8 @@ def main():
                         help="start with edge and Hough views shown")
     parser.add_argument("--logs", default="logs",
                         help="directory the 's' key saves screens and data to")
+    parser.add_argument("--record-seconds", type=float, default=20.0,
+                        help="length of a continuous recording started with 'r'")
     args = parser.parse_args()
 
     capture = cv2.VideoCapture(args.camera)
@@ -996,6 +1049,7 @@ def main():
     tracker = Tracker()
     last_corners, last_aspect, last_focal = None, None, None
     solved_focals = deque(maxlen=30)
+    segment = None
 
     while True:
         ok, frame = capture.read()
@@ -1028,9 +1082,26 @@ def main():
         else:
             last_corners, last_aspect, last_focal = None, None, None
 
-        status = f"{1.0 / max(elapsed, 1e-6):.1f} fps detection | " \
+        # Written before the overlay is drawn, so a recorded segment holds the
+        # frames the camera gave, not the frames with a quadrangle painted on.
+        if segment is not None:
+            running = segment.write(frame, {
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "detected": corners is not None,
+                "detection_seconds": round(float(elapsed), 5),
+                "corners": None if corners is None else corners.tolist(),
+                "held": None if held is None else np.asarray(held).tolist(),
+                "aspect_ratio": last_aspect,
+                "focal_length_pixels": last_focal,
+            })
+            if not running:
+                print(f"recorded {segment.close()}")
+                segment = None
+
+        recording = f"REC {segment.count} " if segment is not None else ""
+        status = f"{recording}{1.0 / max(elapsed, 1e-6):.1f} fps detection | " \
                  f"enhance {'on' if enhancement else 'off'} (e) | " \
-                 f"save (s) | debug (d) | quit (q)"
+                 f"save (s) | record (r) | debug (d) | quit (q)"
         overlay = draw_overlay(frame, last_corners, last_aspect, last_focal, status)
         cv2.imshow("camera + detection", overlay)
 
@@ -1064,12 +1135,22 @@ def main():
                                  last_focal, corners is not None, elapsed,
                                  enhancement, args.scale)
             print(f"saved {saved}")
+        if key == ord("r"):
+            if segment is None:
+                segment = Segment(args.logs, args.record_seconds)
+                print(f"recording {args.record_seconds:.0f}s to {segment.directory}"
+                      f" ('r' again to stop early)")
+            else:
+                print(f"recorded {segment.close()}")
+                segment = None
         if key == ord("d"):
             debug = not debug
             if not debug:
                 cv2.destroyWindow("edges")
                 cv2.destroyWindow("hough (rho x, theta y)")
 
+    if segment is not None:
+        print(f"recorded {segment.close()}")
     capture.release()
     cv2.destroyAllWindows()
 

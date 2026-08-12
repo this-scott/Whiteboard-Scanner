@@ -8,6 +8,8 @@ by size picks the wall instead of the board.
 Run: python test_whiteboard.py
 """
 
+import os
+
 import cv2
 import numpy as np
 
@@ -77,7 +79,41 @@ def demo():
     assert used == 500.0 and again == solved
 
     check_tracker()
+    check_recording()
     print("ok")
+
+
+def check_recording():
+    """A recorded segment holds raw frames and one record per frame."""
+    import json
+    import tempfile
+
+    root = tempfile.mkdtemp()
+    frames = [scene(True), scene(True, (60, 110, 150))]
+    segment = wb.Segment(root, seconds=3600)
+    for frame in frames:
+        assert segment.write(frame, {"detected": True, "corners": None})
+    summary = segment.close()
+
+    written = sorted(os.listdir(segment.directory))
+    assert written == ["00000.png", "00001.png", "records.jsonl"], written
+    with open(os.path.join(segment.directory, "records.jsonl")) as handle:
+        records = [json.loads(line) for line in handle]
+    assert len(records) == len(frames)
+    assert [r["index"] for r in records] == [0, 1]
+    assert [r["frame"] for r in records] == ["00000.png", "00001.png"]
+    assert all("elapsed" in r and r["detected"] for r in records)
+
+    # The frames come back unannotated and unchanged, which is the whole point
+    # of recording them: the views are regenerated from these, not stored.
+    stored = cv2.imread(os.path.join(segment.directory, "00000.png"))
+    assert stored.shape == frames[0].shape and np.array_equal(stored, frames[0])
+
+    # A segment stops itself once it has run its length.
+    brief = wb.Segment(root, seconds=0.0)
+    assert not brief.write(frames[0], {}), "segment ran past its length"
+    brief.close()
+    print("recording %s" % summary.split(" -> ")[0])
 
 
 def check_tracker():
