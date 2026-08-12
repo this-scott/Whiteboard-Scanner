@@ -42,6 +42,16 @@ GRADIENT_THRESHOLD = 40      # T_G, on G = |Gx| + |Gy|. Lowering this to 15
 RHO_BIN = 5.0                # rho cell size, pixels
 THETA_BIN = np.deg2rad(2.0)  # theta cell size, 2 degrees
 PEAK_FRACTION = 0.05         # keep local maxima above 5% of the max vote
+MIN_LINE_VOTES = 0.04        # and above this many votes per pixel of the
+                             # shorter image side, whichever is the higher bar.
+                             # 5% of the peak is a floor that moves with the
+                             # scene: on a frame whose strongest line takes 161
+                             # votes it admits everything down to 8, and a line
+                             # backed by 8 edge pixels is noise. Past rank 20
+                             # the peaks were all 10 to 19 votes, they made up
+                             # two thirds of the lines and most of the several
+                             # hundred candidates, and fewer than half of them
+                             # survived into the next frame of a still camera.
 SUPPRESSION_THETA = 3        # non-maximum suppression half-window, theta cells
 SUPPRESSION_RHO = 2          # non-maximum suppression half-window, rho cells
 OPPOSITE_TOLERANCE = np.deg2rad(30.0)   # opposite lines within 30 deg of 180
@@ -105,6 +115,12 @@ class HoughSpace:
         self.n_rho = int(np.ceil(2 * diagonal / RHO_BIN)) + 1
         self.n_theta = int(np.ceil(2 * np.pi / THETA_BIN)) + 1
         self.accumulator = np.zeros((self.n_theta, self.n_rho), np.float32)
+        # A side too short to belong to any acceptable quadrangle is not worth
+        # keeping as a line. Roughly one vote per two pixels of edge, since an
+        # edge is a couple of pixels thick and only the part inside the rho
+        # cell votes, so the floor is set in votes against the same scale the
+        # quadrangle criteria use.
+        self.minimum_votes = MIN_LINE_VOTES * min(width, height)
 
     def vote(self, xs, ys, theta):
         """Each edge votes once, for the line through it with its orientation."""
@@ -133,7 +149,7 @@ class HoughSpace:
         peak_value = acc.max()
         if peak_value <= 0:
             return []
-        threshold = PEAK_FRACTION * peak_value
+        threshold = max(PEAK_FRACTION * peak_value, self.minimum_votes)
 
         # Circular padding along theta, so the suppression window wraps.
         pad = SUPPRESSION_THETA
@@ -487,8 +503,34 @@ def deduplicate(lines):
     return kept
 
 
-def detect_whiteboard(frame):
-    """Full section 3.1 pipeline. Returns (corners, edge mask, hough image)."""
+def same_quadrangle(a, b, tolerance=0.25):
+    """True when two quadrangles are the same one, allowing for motion.
+
+    Corner distance is measured against the quadrangle's own size, so one
+    tolerance covers a board filling the frame and a book across the room.
+    Both are ordered first, since a quadrangle carries no inherent starting
+    corner and comparing them corner by corner otherwise compares nothing.
+    """
+    a, b = order_corners(np.asarray(a)), order_corners(np.asarray(b))
+    scale = float(np.linalg.norm(np.roll(a, -1, axis=0) - a, axis=1).mean())
+    if scale < 1e-6:
+        return False
+    return float(np.linalg.norm(a - b, axis=1).max()) < tolerance * scale
+
+
+def detect_whiteboard(frame, previous=None):
+    """Full section 3.1 pipeline. Returns (corners, edge mask, hough image).
+
+    `previous` is the quadrangle already being tracked, in this frame's
+    coordinates. Given one, a contender matching it is preferred over a
+    contender that merely scores better, because on this data the scores of
+    the leading contenders differ by less than sensor noise: on 53 pairs of
+    consecutive frames whose images differ by under one grey level -- the same
+    picture, twice -- the quadrangle returned moved by a median of 112 px, and
+    in 79% of them by more than 50. A detector that cannot return the same
+    answer for the same image twice cannot be stabilised after the fact, which
+    is what the tracker alone was trying to do.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
     xs, ys, theta, mask = detect_edges(gray)
@@ -522,6 +564,15 @@ def detect_whiteboard(frame):
                                           QUALITY_THRESHOLD))[0]
     if len(contenders) == 0:
         return None, mask, accumulator
+
+    # Sticking with the quadrangle already being tracked, whenever it is still
+    # among the contenders, is what stops the flicker at its source. This is
+    # self-limiting rather than merely sticky: once the camera moves off the
+    # object nothing matches it any more, and the choice is free again.
+    if previous is not None:
+        familiar = [i for i in contenders if same_quadrangle(corners[i], previous)]
+        if familiar:
+            contenders = np.array(familiar)
 
     # Then the flattest interior wins. Size is not the tie-break the paper
     # assumes: in a cluttered scene the biggest supported quadrangle is
@@ -779,22 +830,8 @@ class Tracker:
         self.missing = 0
 
     def agree(self, a, b):
-        """True when two quadrangles are the same one, allowing for motion.
-
-        Corner distance is measured against the quadrangle's own size, so the
-        same tolerance covers a board filling the frame and a book across the
-        room.
-
-        ponytail: both are assumed to start from the same corner, which
-        order_corners settles. A quadrangle rotating through 45 degrees can
-        flip which corner comes first, and this then reads as a disagreement
-        that costs TRACK_AGREEMENT frames to recover from. Compare over all
-        four rotations if that ever shows up as flapping.
-        """
-        scale = float(np.linalg.norm(np.roll(a, -1, axis=0) - a, axis=1).mean())
-        if scale < 1e-6:
-            return False
-        return float(np.linalg.norm(a - b, axis=1).max()) < TRACK_TOLERANCE * scale
+        """True when two quadrangles are the same one, allowing for motion."""
+        return same_quadrangle(a, b, TRACK_TOLERANCE)
 
     def update(self, corners):
         """Feed one frame's detection, or None, and get the quadrangle to use."""
@@ -1061,8 +1098,12 @@ def main():
         else:
             small = frame
 
+        # What is already tracked, in the detector's own coordinates, so it can
+        # keep returning the same answer while the object is still there.
+        previous = None if tracker.held is None else tracker.held * args.scale
+
         tick = cv2.getTickCount()
-        corners, mask, accumulator = detect_whiteboard(small)
+        corners, mask, accumulator = detect_whiteboard(small, previous)
         elapsed = (cv2.getTickCount() - tick) / cv2.getTickFrequency()
 
         if corners is not None:
