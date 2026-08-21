@@ -1,5 +1,17 @@
 # Whiteboarder
 
+## Preamble
+This paper implementation is the result of a one hour session with Claude Code. 
+
+I attempted to create this once by hand as a project precursor. Eventually I let it go for other projects.
+
+The strategy here was simple: point Claude to the paper and let it create a first implementation with a details logger, test and return the logs, let Claude tune the detector, repeat from step 2. Works *scarily* well
+
+Model used is Opus 5 on high effort. Logs said I used ~569k tokens, the majority of which was likely through reading logs
+
+Original Paper: [Whiteboard Scanning and Image Enhancement](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/11/Digital-Signal-Processing.pdf) 
+
+## Whiteboarder
 Live detection and rectification of a whiteboard — or any flat rectangular
 object — from a webcam, implementing Zhang & He, *Whiteboard Scanning and Image
 Enhancement* (MSR-TR-2003-39).
