@@ -7,7 +7,7 @@ I attempted to create this once by hand as a project precursor. Eventually I let
 
 The strategy here was simple: point Claude to the paper and let it create a first implementation with a details logger, test and return the logs, let Claude tune the detector, repeat from step 2. Works *scarily* well
 
-Model used is Opus 5 on high effort. Logs said I used ~569k tokens, the majority of which was likely through reading logs
+Model used is Opus 5 on high effort. CC logs said I used ~569k tokens, the majority of which was likely through reading images and detections
 
 Original Paper: [Whiteboard Scanning and Image Enhancement](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/11/Digital-Signal-Processing.pdf) 
 
